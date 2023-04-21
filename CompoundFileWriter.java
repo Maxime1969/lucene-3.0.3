@@ -20,11 +20,12 @@ package org.apache.lucene.index;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.IndexOutput;
 import org.apache.lucene.store.IndexInput;
+import org.apache.lucene.util.IOUtils;
+
 import java.util.LinkedList;
 import java.util.HashSet;
 
 import java.io.IOException;
-
 
 /**
  * Combines multiple files into a single compound file.
@@ -45,8 +46,10 @@ import java.io.IOException;
  * file. The {directory} that follows has that many entries. Each directory entry
  * contains a long pointer to the start of this file's data section, and a String
  * with that file's name.
+ * 
+ * @lucene.internal
  */
-final class CompoundFileWriter {
+public final class CompoundFileWriter {
 
     private static final class FileEntry {
         /** source file */
@@ -57,8 +60,21 @@ final class CompoundFileWriter {
 
         /** temporary holder for the start of this file's data section */
         long dataOffset;
+        
+        /** the directory which contains the file. */
+        Directory dir;
     }
 
+    // Before versioning started.
+    static final int FORMAT_PRE_VERSION = 0;
+    
+    // Segment name is not written in the file names.
+    static final int FORMAT_NO_SEGMENT_PREFIX = -1;
+
+    // NOTE: if you introduce a new format, make it 1 lower
+    // than the current one, and always change this if you
+    // switch to a new format!
+    static final int FORMAT_CURRENT = FORMAT_NO_SEGMENT_PREFIX;
 
     private Directory directory;
     private String fileName;
@@ -106,6 +122,14 @@ final class CompoundFileWriter {
      *   has been added already
      */
     public void addFile(String file) {
+      addFile(file, directory);
+    }
+
+    /**
+     * Same as {@link #addFile(String)}, only for files that are found in an
+     * external {@link Directory}.
+     */
+    public void addFile(String file, Directory dir) {
         if (merged)
             throw new IllegalStateException(
                 "Can't add extensions after merge has been called");
@@ -120,32 +144,33 @@ final class CompoundFileWriter {
 
         FileEntry entry = new FileEntry();
         entry.file = file;
+        entry.dir = dir;
         entries.add(entry);
     }
 
     /** Merge files with the extensions added up to now.
      *  All files with these extensions are combined sequentially into the
-     *  compound stream. After successful merge, the source files
-     *  are deleted.
+     *  compound stream.
      *  @throws IllegalStateException if close() had been called before or
      *   if no file has been added to this object
      */
     public void close() throws IOException {
         if (merged)
-            throw new IllegalStateException(
-                "Merge already performed");
+            throw new IllegalStateException("Merge already performed");
 
         if (entries.isEmpty())
-            throw new IllegalStateException(
-                "No entries to merge have been defined");
+            throw new IllegalStateException("No entries to merge have been defined");
 
         merged = true;
 
         // open the compound stream
-        IndexOutput os = null;
+        IndexOutput os = directory.createOutput(fileName);
+        IOException priorException = null;
         try {
-            os = directory.createOutput(fileName);
-
+            // Write the Version info - must be a VInt because CFR reads a VInt
+            // in older versions!
+            os.writeVInt(FORMAT_CURRENT);
+            
             // Write the number of entries
             os.writeVInt(entries.size());
 
@@ -156,8 +181,8 @@ final class CompoundFileWriter {
             for (FileEntry fe : entries) {
                 fe.directoryOffset = os.getFilePointer();
                 os.writeLong(0);    // for now
-                os.writeString(fe.file);
-                totalSize += directory.fileLength(fe.file);
+                os.writeString(IndexFileNames.stripSegmentName(fe.file));
+                totalSize += fe.dir.fileLength(fe.file);
             }
 
             // Pre-allocate size of file as optimization --
@@ -171,10 +196,9 @@ final class CompoundFileWriter {
 
             // Open the files and copy their data into the stream.
             // Remember the locations of each file's data section.
-            byte buffer[] = new byte[16384];
             for (FileEntry fe : entries) {
                 fe.dataOffset = os.getFilePointer();
-                copyFile(fe, os, buffer);
+                copyFile(fe, os);
             }
 
             // Write the data offsets into the directory of the compound stream
@@ -192,56 +216,37 @@ final class CompoundFileWriter {
             IndexOutput tmp = os;
             os = null;
             tmp.close();
-
+        } catch (IOException e) {
+          priorException = e;
         } finally {
-            if (os != null) try { os.close(); } catch (IOException e) { }
+          IOUtils.closeSafely(priorException, os);
         }
     }
 
-    /** Copy the contents of the file with specified extension into the
-     *  provided output stream. Use the provided buffer for moving data
-     *  to reduce memory allocation.
-     */
-    private void copyFile(FileEntry source, IndexOutput os, byte buffer[])
-    throws IOException
-    {
-        IndexInput is = null;
-        try {
-            long startPtr = os.getFilePointer();
+  /**
+   * Copy the contents of the file with specified extension into the provided
+   * output stream.
+   */
+  private void copyFile(FileEntry source, IndexOutput os) throws IOException {
+    IndexInput is = source.dir.openInput(source.file);
+    try {
+      long startPtr = os.getFilePointer();
+      long length = is.length();
+      os.copyBytes(is, length);
 
-            is = directory.openInput(source.file);
-            long length = is.length();
-            long remainder = length;
-            int chunk = buffer.length;
+      if (checkAbort != null) {
+        checkAbort.work(length);
+      }
 
-            while(remainder > 0) {
-                int len = (int) Math.min(chunk, remainder);
-                is.readBytes(buffer, 0, len, false);
-                os.writeBytes(buffer, len);
-                remainder -= len;
-                if (checkAbort != null)
-                  // Roughly every 2 MB we will check if
-                  // it's time to abort
-                  checkAbort.work(80);
-            }
+      // Verify that the output length diff is equal to original file
+      long endPtr = os.getFilePointer();
+      long diff = endPtr - startPtr;
+      if (diff != length)
+        throw new IOException("Difference in the output file offsets " + diff
+            + " does not match the original file length " + length);
 
-            // Verify that remainder is 0
-            if (remainder != 0)
-                throw new IOException(
-                    "Non-zero remainder length after copying: " + remainder
-                    + " (id: " + source.file + ", length: " + length
-                    + ", buffer size: " + chunk + ")");
-
-            // Verify that the output length diff is equal to original file
-            long endPtr = os.getFilePointer();
-            long diff = endPtr - startPtr;
-            if (diff != length)
-                throw new IOException(
-                    "Difference in the output file offsets " + diff
-                    + " does not match the original file length " + length);
-
-        } finally {
-            if (is != null) is.close();
-        }
+    } finally {
+      is.close();
     }
+  }
 }

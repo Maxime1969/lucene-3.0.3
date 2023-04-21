@@ -53,8 +53,6 @@ final class DocInverter extends DocFieldConsumer {
     Map<InvertedDocEndConsumerPerThread,Collection<InvertedDocEndConsumerPerField>> endChildThreadsAndFields = new HashMap<InvertedDocEndConsumerPerThread,Collection<InvertedDocEndConsumerPerField>>();
 
     for (Map.Entry<DocFieldConsumerPerThread,Collection<DocFieldConsumerPerField>> entry : threadsAndFields.entrySet() ) {
-
-
       DocInverterPerThread perThread = (DocInverterPerThread) entry.getKey();
 
       Collection<InvertedDocConsumerPerField> childFields = new HashSet<InvertedDocConsumerPerField>();
@@ -74,15 +72,12 @@ final class DocInverter extends DocFieldConsumer {
   }
 
   @Override
-  public void closeDocStore(SegmentWriteState state) throws IOException {
-    consumer.closeDocStore(state);
-    endConsumer.closeDocStore(state);
-  }
-
-  @Override
   void abort() {
-    consumer.abort();
-    endConsumer.abort();
+    try {
+      consumer.abort();
+    } finally {
+      endConsumer.abort();
+    }
   }
 
   @Override

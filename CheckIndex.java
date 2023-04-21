@@ -17,9 +17,12 @@ package org.apache.lucene.index;
  * limitations under the License.
  */
 
+import org.apache.lucene.search.IndexSearcher;
+import org.apache.lucene.search.TermQuery;
 import org.apache.lucene.store.FSDirectory;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.IndexInput;
+import org.apache.lucene.util.StringHelper;
 import org.apache.lucene.document.AbstractField;  // for javadocs
 import org.apache.lucene.document.Document;
 
@@ -29,6 +32,7 @@ import java.io.IOException;
 import java.io.File;
 import java.util.Collection;
 
+import java.util.Comparator;
 import java.util.List;
 import java.util.ArrayList;
 import java.util.Map;
@@ -41,9 +45,7 @@ import java.util.Map;
  * <p>As this tool checks every byte in the index, on a large
  * index it can take quite a long time to run.
  *
- * <p><b>WARNING</b>: this tool and API is new and
- * experimental and is subject to suddenly change in the
- * next release.  Please make a complete backup of your
+ * @lucene.experimental Please make a complete backup of your
  * index before using this to fix your index!
  */
 public class CheckIndex {
@@ -54,8 +56,7 @@ public class CheckIndex {
   /**
    * Returned from {@link #checkIndex()} detailing the health and status of the index.
    *
-   * <p><b>WARNING</b>: this API is new and experimental and is
-   * subject to suddenly change in the next release.
+   * @lucene.experimental
    **/
 
   public static class Status {
@@ -111,6 +112,12 @@ public class CheckIndex {
      * #checkIndex(List)}) was called with non-null
      * argument). */
     public boolean partial;
+
+    /** The greatest segment name. */
+    public int maxSegmentName;
+
+    /** Whether the SegmentInfos.counter is greater than any of the segments' names. */
+    public boolean validCounter; 
 
     /** Holds the userData of the last commit in the index */
     public Map<String, String> userData;
@@ -326,6 +333,30 @@ public class CheckIndex {
       return result;
     }
 
+    // find the oldest and newest segment versions
+    String oldest = Integer.toString(Integer.MAX_VALUE), newest = Integer.toString(Integer.MIN_VALUE);
+    String oldSegs = null;
+    boolean foundNonNullVersion = false;
+    Comparator<String> versionComparator = StringHelper.getVersionComparator();
+    for (SegmentInfo si : sis) {
+      String version = si.getVersion();
+      if (version == null) {
+        // pre-3.1 segment
+        oldSegs = "pre-3.1";
+      } else if (version.equals("2.x")) {
+        // an old segment that was 'touched' by 3.1+ code
+        oldSegs = "2.x";
+      } else {
+        foundNonNullVersion = true;
+        if (versionComparator.compare(version, oldest) < 0) {
+          oldest = version;
+        }
+        if (versionComparator.compare(version, newest) > 0) {
+          newest = version;
+        }
+      }
+    }
+    
     final int numSegments = sis.size();
     final String segmentsFileName = sis.getCurrentSegmentFileName();
     IndexInput input = null;
@@ -374,6 +405,12 @@ public class CheckIndex {
         sFormat = "FORMAT_USER_DATA [Lucene 2.9]";
       else if (format == SegmentInfos.FORMAT_DIAGNOSTICS)
         sFormat = "FORMAT_DIAGNOSTICS [Lucene 2.9]";
+      else if (format == SegmentInfos.FORMAT_HAS_VECTORS)
+        sFormat = "FORMAT_HAS_VECTORS [Lucene 3.1]";
+      else if (format == SegmentInfos.FORMAT_3_1)
+        sFormat = "FORMAT_3_1 [Lucene 3.1+]";
+      else if (format == SegmentInfos.CURRENT_FORMAT)
+        throw new RuntimeException("BUG: You should update this tool!");
       else if (format < SegmentInfos.CURRENT_FORMAT) {
         sFormat = "int=" + format + " [newer version of Lucene than this tool]";
         skip = true;
@@ -393,7 +430,19 @@ public class CheckIndex {
       userDataString = "";
     }
 
-    msg("Segments file=" + segmentsFileName + " numSegments=" + numSegments + " version=" + sFormat + userDataString);
+    String versionString = null;
+    if (oldSegs != null) {
+      if (foundNonNullVersion) {
+        versionString = "versions=[" + oldSegs + " .. " + newest + "]";
+      } else {
+        versionString = "version=" + oldSegs;
+      }
+    } else {
+      versionString = oldest.equals(newest) ? ( "version=" + oldest ) : ("versions=[" + oldest + " .. " + newest + "]");
+    }
+    
+    msg("Segments file=" + segmentsFileName + " numSegments=" + numSegments
+        + " " + versionString + " format=" + sFormat + userDataString);
 
     if (onlySegments != null) {
       result.partial = true;
@@ -416,9 +465,14 @@ public class CheckIndex {
 
     result.newSegments = (SegmentInfos) sis.clone();
     result.newSegments.clear();
+    result.maxSegmentName = -1;
 
     for(int i=0;i<numSegments;i++) {
       final SegmentInfo info = sis.info(i);
+      int segmentName = Integer.parseInt(info.name.substring(1), Character.MAX_RADIX);
+      if (segmentName > result.maxSegmentName) {
+        result.maxSegmentName = segmentName;
+      }
       if (onlySegments != null && !onlySegments.contains(info.name))
         continue;
       Status.SegmentInfoStatus segInfoStat = new Status.SegmentInfoStatus();
@@ -438,8 +492,8 @@ public class CheckIndex {
         segInfoStat.hasProx = info.getHasProx();
         msg("    numFiles=" + info.files().size());
         segInfoStat.numFiles = info.files().size();
-        msg("    size (MB)=" + nf.format(info.sizeInBytes()/(1024.*1024.)));
-        segInfoStat.sizeMB = info.sizeInBytes()/(1024.*1024.);
+        segInfoStat.sizeMB = info.sizeInBytes(true)/(1024.*1024.);
+        msg("    size (MB)=" + nf.format(segInfoStat.sizeMB));
         Map<String,String> diagnostics = info.getDiagnostics();
         segInfoStat.diagnostics = diagnostics;
         if (diagnostics.size() > 0) {
@@ -550,9 +604,18 @@ public class CheckIndex {
 
     if (0 == result.numBadSegments) {
       result.clean = true;
-      msg("No problems were detected with this index.\n");
     } else
       msg("WARNING: " + result.numBadSegments + " broken segments (containing " + result.totLoseDocCount + " documents) detected");
+
+    if ( ! (result.validCounter = (result.maxSegmentName < sis.counter))) {
+      result.clean = false;
+      result.newSegments.counter = result.maxSegmentName + 1; 
+      msg("ERROR: Next segment name counter " + sis.counter + " is not greater than max segment name " + result.maxSegmentName);
+    }
+    
+    if (result.clean) {
+      msg("No problems were detected with this index.\n");
+    }
 
     return result;
   }
@@ -594,6 +657,8 @@ public class CheckIndex {
   private Status.TermIndexStatus testTermIndex(SegmentInfo info, SegmentReader reader) {
     final Status.TermIndexStatus status = new Status.TermIndexStatus();
 
+    final IndexSearcher is = new IndexSearcher(reader);
+
     try {
       if (infoStream != null) {
         infoStream.print("    test: terms, freq, prox...");
@@ -601,15 +666,18 @@ public class CheckIndex {
 
       final TermEnum termEnum = reader.terms();
       final TermPositions termPositions = reader.termPositions();
+      final int postingsSkipInterval = reader.getPostingsSkipInterval();
 
       // Used only to count up # deleted docs for this term
       final MySegmentTermDocs myTermDocs = new MySegmentTermDocs(reader);
 
       final int maxDoc = reader.maxDoc();
-
+      Term lastTerm = null;
       while (termEnum.next()) {
         status.termCount++;
         final Term term = termEnum.term();
+        lastTerm = term;
+
         final int docFreq = termEnum.docFreq();
         termPositions.seek(term);
         int lastDoc = -1;
@@ -640,6 +708,47 @@ public class CheckIndex {
           }
         }
 
+        // Test skipping
+        if (docFreq >= postingsSkipInterval) {
+          
+          for(int idx=0;idx<7;idx++) {
+            final int skipDocID = (int) (((idx+1)*(long) maxDoc)/8);
+            termPositions.seek(term);
+            if (!termPositions.skipTo(skipDocID)) {
+              break;
+            } else {
+
+              final int docID = termPositions.doc();
+              if (docID < skipDocID) {
+                throw new RuntimeException("term " + term + ": skipTo(docID=" + skipDocID + ") returned docID=" + docID);
+              }
+              final int freq = termPositions.freq();
+              if (freq <= 0) {
+                throw new RuntimeException("termFreq " + freq + " is out of bounds");
+              }
+              int lastPosition = -1;
+              for(int posUpto=0;posUpto<freq;posUpto++) {
+                final int pos = termPositions.nextPosition();
+                if (pos < 0) {
+                  throw new RuntimeException("position " + pos + " is out of bounds");
+                }
+                if (pos <= lastPosition) {
+                  throw new RuntimeException("position " + pos + " is <= lastPosition " + lastPosition);
+                }
+                lastPosition = pos;
+              } 
+
+              if (!termPositions.next()) {
+                break;
+              }
+              final int nextDocID = termPositions.doc();
+              if (nextDocID <= docID) {
+                throw new RuntimeException("term " + term + ": skipTo(docID=" + skipDocID + "), then .next() returned docID=" + nextDocID + " vs prev docID=" + docID);
+              }
+            }
+          }
+        }
+
         // Now count how many deleted docs occurred in
         // this term:
         final int delCount;
@@ -655,6 +764,11 @@ public class CheckIndex {
           throw new RuntimeException("term " + term + " docFreq=" + 
                                      docFreq + " != num docs seen " + freq0 + " + num docs deleted " + delCount);
         }
+      }
+
+      // Test search on last term:
+      if (lastTerm != null) {
+        is.search(new TermQuery(lastTerm), 1);
       }
 
       msg("OK [" + status.termCount + " terms; " + status.totFreq + " terms/docs pairs; " + status.totPos + " tokens]");
@@ -758,6 +872,7 @@ public class CheckIndex {
   public void fixIndex(Status result) throws IOException {
     if (result.partial)
       throw new IllegalArgumentException("can only fix an index that was fully checked (this status checked a subset of segments)");
+    result.newSegments.changed();
     result.newSegments.commit(result.dir);
   }
 
@@ -904,7 +1019,7 @@ public class CheckIndex {
     System.out.println("");
 
     final int exitCode;
-    if (result != null && result.clean == true)
+    if (result.clean == true)
       exitCode = 0;
     else
       exitCode = 1;
