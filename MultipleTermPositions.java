@@ -17,13 +17,13 @@ package org.apache.lucene.index;
  * limitations under the License.
  */
 
-import org.apache.lucene.util.PriorityQueue;
-
 import java.io.IOException;
 import java.util.Arrays;
-
 import java.util.LinkedList;
 import java.util.List;
+
+import org.apache.lucene.util.PriorityQueue;
+import org.apache.lucene.util.ArrayUtil;
 
 /**
  * Allows you to iterate over the {@link TermPositions} for multiple {@link Term}s as
@@ -83,10 +83,8 @@ public class MultipleTermPositions implements TermPositions {
     }
 
     private void growArray() {
-      int[] newArray = new int[_arraySize * 2];
-      System.arraycopy(_array, 0, newArray, 0, _arraySize);
-      _array = newArray;
-      _arraySize *= 2;
+      _array = ArrayUtil.grow(_array, _arraySize+1);
+      _arraySize = _array.length;
     }
   }
 
@@ -121,8 +119,10 @@ public class MultipleTermPositions implements TermPositions {
     do {
       tp = _termPositionsQueue.peek();
 
-      for (int i = 0; i < tp.freq(); i++)
+      for (int i = 0; i < tp.freq(); i++) {
+        // NOTE: this can result in dup positions being added!
         _posList.add(tp.nextPosition());
+      }
 
       if (tp.next())
         _termPositionsQueue.updateTop();
@@ -139,6 +139,8 @@ public class MultipleTermPositions implements TermPositions {
   }
 
   public final int nextPosition() {
+    // NOTE: this may return the same position more than
+    // once (see TestMultiPhraseQuery.testZeroPosIncr)
     return _posList.next();
   }
 

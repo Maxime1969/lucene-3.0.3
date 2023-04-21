@@ -27,6 +27,7 @@ import java.util.ArrayList;
 
 import org.apache.lucene.store.IndexOutput;
 import org.apache.lucene.search.Similarity;
+import org.apache.lucene.util.IOUtils;
 
 // TODO FI: norms could actually be stored as doc store
 
@@ -37,7 +38,7 @@ import org.apache.lucene.search.Similarity;
 
 final class NormsWriter extends InvertedDocEndConsumer {
 
-  private static final byte defaultNorm = Similarity.encodeNorm(1.0f);
+  private final byte defaultNorm = Similarity.getDefault().encodeNormValue(1.0f);
   private FieldInfos fieldInfos;
   @Override
   public InvertedDocEndConsumerPerThread addThread(DocInverterPerThread docInverterPerThread) {
@@ -88,12 +89,11 @@ final class NormsWriter extends InvertedDocEndConsumer {
       }
     }
 
-    final String normsFileName = state.segmentName + "." + IndexFileNames.NORMS_EXTENSION;
-    state.flushedFiles.add(normsFileName);
+    final String normsFileName = IndexFileNames.segmentFileName(state.segmentName, IndexFileNames.NORMS_EXTENSION);
     IndexOutput normsOut = state.directory.createOutput(normsFileName);
-
+    boolean success = false;
     try {
-      normsOut.writeBytes(SegmentMerger.NORMS_HEADER, 0, SegmentMerger.NORMS_HEADER.length);
+      normsOut.writeBytes(SegmentNorms.NORMS_HEADER, 0, SegmentNorms.NORMS_HEADER.length);
 
       final int numField = fieldInfos.size();
 
@@ -166,12 +166,9 @@ final class NormsWriter extends InvertedDocEndConsumer {
 
         assert 4+normCount*state.numDocs == normsOut.getFilePointer() : ".nrm file size mismatch: expected=" + (4+normCount*state.numDocs) + " actual=" + normsOut.getFilePointer();
       }
-
+      success = true;
     } finally {
-      normsOut.close();
+      IOUtils.closeSafely(!success, normsOut);
     }
   }
-
-  @Override
-  void closeDocStore(SegmentWriteState state) {}
 }

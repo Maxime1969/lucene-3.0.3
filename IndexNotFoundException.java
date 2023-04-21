@@ -17,28 +17,16 @@ package org.apache.lucene.index;
  * limitations under the License.
  */
 
-import java.util.Collection;
-import java.util.Map;
-import java.io.IOException;
+import java.io.FileNotFoundException;
 
-abstract class InvertedDocConsumer {
+/**
+ * Signals that no index was found in the Directory. Possibly because the
+ * directory is empty, however can also indicate an index corruption.
+ */
+public final class IndexNotFoundException extends FileNotFoundException {
 
-  /** Add a new thread */
-  abstract InvertedDocConsumerPerThread addThread(DocInverterPerThread docInverterPerThread);
-
-  /** Abort (called after hitting AbortException) */
-  abstract void abort();
-
-  /** Flush a new segment */
-  abstract void flush(Map<InvertedDocConsumerPerThread,Collection<InvertedDocConsumerPerField>> threadsAndFields, SegmentWriteState state) throws IOException;
-
-  /** Attempt to free RAM, returning true if any RAM was
-   *  freed */
-  abstract boolean freeRAM();
-
-  FieldInfos fieldInfos;
-
-  void setFieldInfos(FieldInfos fieldInfos) {
-    this.fieldInfos = fieldInfos;
+  public IndexNotFoundException(String msg) {
+    super(msg);
   }
+
 }

@@ -17,28 +17,25 @@ package org.apache.lucene.index;
  * limitations under the License.
  */
 
-import java.util.Collection;
-import java.util.Map;
 import java.io.IOException;
+import java.util.List;
 
-abstract class InvertedDocConsumer {
+/**
+ * An {@link IndexDeletionPolicy} which keeps all index commits around, never
+ * deleting them. This class is a singleton and can be accessed by referencing
+ * {@link #INSTANCE}.
+ */
+public final class NoDeletionPolicy implements IndexDeletionPolicy {
 
-  /** Add a new thread */
-  abstract InvertedDocConsumerPerThread addThread(DocInverterPerThread docInverterPerThread);
-
-  /** Abort (called after hitting AbortException) */
-  abstract void abort();
-
-  /** Flush a new segment */
-  abstract void flush(Map<InvertedDocConsumerPerThread,Collection<InvertedDocConsumerPerField>> threadsAndFields, SegmentWriteState state) throws IOException;
-
-  /** Attempt to free RAM, returning true if any RAM was
-   *  freed */
-  abstract boolean freeRAM();
-
-  FieldInfos fieldInfos;
-
-  void setFieldInfos(FieldInfos fieldInfos) {
-    this.fieldInfos = fieldInfos;
+  /** The single instance of this class. */
+  public static final IndexDeletionPolicy INSTANCE = new NoDeletionPolicy();
+  
+  private NoDeletionPolicy() {
+    // keep private to avoid instantiation
   }
+  
+  public void onCommit(List<? extends IndexCommit> commits) throws IOException {}
+
+  public void onInit(List<? extends IndexCommit> commits) throws IOException {}
+  
 }
