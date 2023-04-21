@@ -1,2 +1,2 @@
-# lucene-3.0.3
-Lucene 3.0.3 est une bibliothèque de recherche et d'indexation de texte open source, développé en Java. Un certain nombre de classes est répertorié.
+# reach_codePoltergesit
+reach_codePoltergesit is a code bundle consisting of Lucene 3.0.3, Lucene 3.3.0 (org.apache.lucene.index and org.apache.lucene.util.fst), Lucene 7.0.1 (org.apache.lucene.index) and java code containing classes considered as instances of Poltergeist. Lucene builds are open source text search and indexing libraries, developed in Java. This code database is used to detect the anti-pattern Poltergeist.
