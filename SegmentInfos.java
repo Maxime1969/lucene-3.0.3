@@ -23,27 +23,30 @@ import org.apache.lucene.store.IndexOutput;
 import org.apache.lucene.store.ChecksumIndexOutput;
 import org.apache.lucene.store.ChecksumIndexInput;
 import org.apache.lucene.store.NoSuchDirectoryException;
+import org.apache.lucene.util.IOUtils;
 import org.apache.lucene.util.ThreadInterruptedException;
 
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.PrintStream;
-import java.util.Vector;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.HashMap;
+import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * A collection of segmentInfo objects with methods for operating on
  * those segments in relation to the file system.
  * 
- * <p><b>NOTE:</b> This API is new and still experimental
- * (subject to change suddenly in the next release)</p>
+ * @lucene.experimental
  */
-public final class SegmentInfos extends Vector<SegmentInfo> {
+public final class SegmentInfos implements Cloneable, Iterable<SegmentInfo> {
 
   /** The file format version, a negative number. */
   /* Works since counter, the old 1st entry, is always >= 0 */
@@ -90,15 +93,21 @@ public final class SegmentInfos extends Vector<SegmentInfo> {
    *  diagnostics storage, and switches userData to Map */
   public static final int FORMAT_DIAGNOSTICS = -9;
 
+  /** Each segment records whether it has term vectors */
+  public static final int FORMAT_HAS_VECTORS = -10;
+
+  /** Each segment records the Lucene version that created it. */
+  public static final int FORMAT_3_1 = -11;
+  
   /* This must always point to the most recent file format. */
-  static final int CURRENT_FORMAT = FORMAT_DIAGNOSTICS;
+  public static final int CURRENT_FORMAT = FORMAT_3_1;
   
   public int counter = 0;    // used to name new segments
   /**
    * counts how often the index has been changed by adding or deleting docs.
    * starting with the current time in milliseconds forces to create unique version numbers.
    */
-  private long version = System.currentTimeMillis();
+  long version = System.currentTimeMillis();
 
   private long generation = 0;     // generation of the "segments_N" for the next commit
   private long lastGeneration = 0; // generation of the "segments_N" file we last successfully read
@@ -107,14 +116,29 @@ public final class SegmentInfos extends Vector<SegmentInfo> {
 
   private Map<String,String> userData = Collections.<String,String>emptyMap();       // Opaque Map<String, String> that user can specify during IndexWriter.commit
 
+  private int format;
+  
+  private List<SegmentInfo> segments = new ArrayList<SegmentInfo>();
+  private Set<SegmentInfo> segmentSet = new HashSet<SegmentInfo>();
+  private transient List<SegmentInfo> cachedUnmodifiableList;
+  private transient Set<SegmentInfo> cachedUnmodifiableSet;  
+  
   /**
    * If non-null, information about loading segments_N files
    * will be printed here.  @see #setInfoStream.
    */
-  private static PrintStream infoStream;
+  private static PrintStream infoStream = null;
 
-  public final SegmentInfo info(int i) {
-    return get(i);
+  public void setFormat(int format) {
+    this.format = format;
+  }
+
+  public int getFormat() {
+    return format;
+  }
+
+  public SegmentInfo info(int i) {
+    return segments.get(i);
   }
 
   /**
@@ -233,7 +257,7 @@ public final class SegmentInfos extends Vector<SegmentInfo> {
     boolean success = false;
 
     // Clear any previous segments:
-    clear();
+    this.clear();
 
     ChecksumIndexInput input = new ChecksumIndexInput(directory.openInput(segmentFileName));
 
@@ -255,7 +279,30 @@ public final class SegmentInfos extends Vector<SegmentInfo> {
       }
       
       for (int i = input.readInt(); i > 0; i--) { // read segmentInfos
-        add(new SegmentInfo(directory, format, input));
+        SegmentInfo si = new SegmentInfo(directory, format, input);
+        if (si.getVersion() == null) {
+          // It's a pre-3.1 segment, upgrade its version to either 3.0 or 2.x
+          Directory dir = directory;
+          if (si.getDocStoreOffset() != -1) {
+            if (si.getDocStoreIsCompoundFile()) {
+              dir = new CompoundFileReader(dir, IndexFileNames.segmentFileName(
+                  si.getDocStoreSegment(),
+                  IndexFileNames.COMPOUND_FILE_STORE_EXTENSION), 1024);
+            }
+          } else if (si.getUseCompoundFile()) {
+            dir = new CompoundFileReader(dir, IndexFileNames.segmentFileName(
+                si.name, IndexFileNames.COMPOUND_FILE_EXTENSION), 1024);
+          }
+
+          try {
+            String store = si.getDocStoreOffset() != -1 ? si.getDocStoreSegment() : si.name;
+            si.setVersion(FieldsReader.detectCodeVersion(dir, store));
+          } finally {
+            // If we opened the directory, close it
+            if (dir != directory) dir.close();
+          }
+        }
+        add(si);
       }
       
       if(format >= 0){    // in old format the version number may be at the end of the file
@@ -290,7 +337,7 @@ public final class SegmentInfos extends Vector<SegmentInfo> {
       if (!success) {
         // Clear any segment infos we had loaded so we
         // have a clean slate on retry:
-        clear();
+        this.clear();
       }
     }
   }
@@ -336,26 +383,21 @@ public final class SegmentInfos extends Vector<SegmentInfo> {
 
     try {
       segnOutput.writeInt(CURRENT_FORMAT); // write FORMAT
-      segnOutput.writeLong(++version); // every write changes
-                                   // the index
+      segnOutput.writeLong(version); 
       segnOutput.writeInt(counter); // write counter
       segnOutput.writeInt(size()); // write infos
-      for (int i = 0; i < size(); i++) {
-        info(i).write(segnOutput);
+      for (SegmentInfo si : this) {
+        si.write(segnOutput);
       }
       segnOutput.writeStringStringMap(userData);
       segnOutput.prepareCommit();
-      success = true;
       pendingSegnOutput = segnOutput;
+      success = true;
     } finally {
       if (!success) {
         // We hit an exception above; try to close the file
         // but suppress any exception:
-        try {
-          segnOutput.close();
-        } catch (Throwable t) {
-          // Suppress so we keep throwing the original exception
-        }
+        IOUtils.closeSafely(true, segnOutput);
         try {
           // Try not to leave a truncated segments_N file in
           // the index:
@@ -367,6 +409,18 @@ public final class SegmentInfos extends Vector<SegmentInfo> {
     }
   }
 
+  /** Prunes any segment whose docs are all deleted. */
+  public void pruneDeletedSegments() throws IOException {
+    for(final Iterator<SegmentInfo> it = segments.iterator(); it.hasNext();) {
+      final SegmentInfo info = it.next();
+      if (info.getDelCount() == info.docCount) {
+        it.remove();
+        segmentSet.remove(info);
+      }
+    }
+    assert segmentSet.size() == segments.size();
+  }
+
   /**
    * Returns a copy of this instance, also copying each
    * SegmentInfo.
@@ -374,12 +428,22 @@ public final class SegmentInfos extends Vector<SegmentInfo> {
   
   @Override
   public Object clone() {
-    SegmentInfos sis = (SegmentInfos) super.clone();
-    for(int i=0;i<sis.size();i++) {
-      sis.set(i, (SegmentInfo) sis.info(i).clone());
+    try {
+      final SegmentInfos sis = (SegmentInfos) super.clone();
+      // deep clone, first recreate all collections:
+      sis.segments = new ArrayList<SegmentInfo>(size());
+      sis.segmentSet = new HashSet<SegmentInfo>(size());
+      sis.cachedUnmodifiableList = null;
+      sis.cachedUnmodifiableSet = null;
+      for(final SegmentInfo info : this) {
+        // dont directly access segments, use add method!!!
+        sis.add((SegmentInfo) info.clone());
+      }
+      sis.userData = new HashMap<String,String>(userData);
+      return sis;
+    } catch (CloneNotSupportedException e) {
+      throw new RuntimeException("should not happen", e);
     }
-    sis.userData = new HashMap<String, String>(userData);
-    return sis;
   }
 
   /**
@@ -494,10 +558,14 @@ public final class SegmentInfos extends Vector<SegmentInfo> {
     return infoStream;
   }
 
+  /**
+   * Prints the given message to the infoStream. Note, this method does not
+   * check for null infoStream. It assumes this check has been performed by the
+   * caller, which is recommended to avoid the (usually) expensive message
+   * creation.
+   */
   private static void message(String message) {
-    if (infoStream != null) {
-      infoStream.println("SIS [" + Thread.currentThread().getName() + "]: " + message);
-    }
+    infoStream.println("SIS [" + Thread.currentThread().getName() + "]: " + message);
   }
 
   /**
@@ -533,9 +601,9 @@ public final class SegmentInfos extends Vector<SegmentInfo> {
       long gen = 0;
       int genLookaheadCount = 0;
       IOException exc = null;
-      boolean retry = false;
+      int retryCount = 0;
 
-      int method = 0;
+      boolean useFirstMethod = true;
 
       // Loop until we succeed in calling doBody() without
       // hitting an IOException.  An IOException most likely
@@ -549,14 +617,15 @@ public final class SegmentInfos extends Vector<SegmentInfo> {
       // it.
       
       // We have three methods for determining the current
-      // generation.  We try the first two in parallel, and
-      // fall back to the third when necessary.
+      // generation.  We try the first two in parallel (when
+      // useFirstMethod is true), and fall back to the third
+      // when necessary.
 
       while(true) {
 
-        if (0 == method) {
+        if (useFirstMethod) {
 
-          // Method 1: list the directory and use the highest
+          // List the directory and use the highest
           // segments_N file.  This method works well as long
           // as there is no stale caching on the directory
           // contents (NOTE: NFS clients often have such stale
@@ -567,12 +636,15 @@ public final class SegmentInfos extends Vector<SegmentInfo> {
 
           files = directory.listAll();
           
-          if (files != null)
+          if (files != null) {
             genA = getCurrentSegmentGeneration(files);
+          }
+          
+          if (infoStream != null) {
+            message("directory listing genA=" + genA);
+          }
 
-          message("directory listing genA=" + genA);
-
-          // Method 2: open segments.gen and read its
+          // Also open segments.gen and read its
           // contents.  Then we take the larger of the two
           // gens.  This way, if either approach is hitting
           // a stale cache (NFS) we have a better chance of
@@ -583,10 +655,14 @@ public final class SegmentInfos extends Vector<SegmentInfo> {
             try {
               genInput = directory.openInput(IndexFileNames.SEGMENTS_GEN);
             } catch (FileNotFoundException e) {
-              message("segments.gen open: FileNotFoundException " + e);
+              if (infoStream != null) {
+                message("segments.gen open: FileNotFoundException " + e);
+              }
               break;
             } catch (IOException e) {
-              message("segments.gen open: IOException " + e);
+              if (infoStream != null) {
+                message("segments.gen open: IOException " + e);
+              }
             }
   
             if (genInput != null) {
@@ -595,7 +671,9 @@ public final class SegmentInfos extends Vector<SegmentInfo> {
                 if (version == FORMAT_LOCKLESS) {
                   long gen0 = genInput.readLong();
                   long gen1 = genInput.readLong();
-                  message("fallback check: " + gen0 + "; " + gen1);
+                  if (infoStream != null) {
+                    message("fallback check: " + gen0 + "; " + gen1);
+                  }
                   if (gen0 == gen1) {
                     // The file is consistent.
                     genB = gen0;
@@ -615,56 +693,51 @@ public final class SegmentInfos extends Vector<SegmentInfo> {
             }
           }
 
-          message(IndexFileNames.SEGMENTS_GEN + " check: genB=" + genB);
+          if (infoStream != null) {
+            message(IndexFileNames.SEGMENTS_GEN + " check: genB=" + genB);
+          }
 
           // Pick the larger of the two gen's:
           if (genA > genB)
             gen = genA;
           else
             gen = genB;
-          
+
           if (gen == -1) {
             // Neither approach found a generation
-            throw new FileNotFoundException("no segments* file found in " + directory + ": files: " + Arrays.toString(files));
+            throw new IndexNotFoundException("no segments* file found in " + directory + ": files: " + Arrays.toString(files));
           }
         }
 
-        // Third method (fallback if first & second methods
-        // are not reliable): since both directory cache and
+        if (useFirstMethod && lastGen == gen && retryCount >= 2) {
+          // Give up on first method -- this is 3rd cycle on
+          // listing directory and checking gen file to
+          // attempt to locate the segments file.
+          useFirstMethod = false;
+        }
+
+        // Second method: since both directory cache and
         // file contents cache seem to be stale, just
         // advance the generation.
-        if (1 == method || (0 == method && lastGen == gen && retry)) {
-
-          method = 1;
-
+        if (!useFirstMethod) {
           if (genLookaheadCount < defaultGenLookaheadCount) {
             gen++;
             genLookaheadCount++;
-            message("look ahead increment gen to " + gen);
-          }
-        }
-
-        if (lastGen == gen) {
-
-          // This means we're about to try the same
-          // segments_N last tried.  This is allowed,
-          // exactly once, because writer could have been in
-          // the process of writing segments_N last time.
-
-          if (retry) {
-            // OK, we've tried the same segments_N file
-            // twice in a row, so this must be a real
-            // error.  We throw the original exception we
-            // got.
-            throw exc;
+            if (infoStream != null) {
+              message("look ahead increment gen to " + gen);
+            }
           } else {
-            retry = true;
+            // All attempts have failed -- throw first exc:
+            throw exc;
           }
-
-        } else if (0 == method) {
-          // Segment file has advanced since our last loop, so
-          // reset retry:
-          retry = false;
+        } else if (lastGen == gen) {
+          // This means we're about to try the same
+          // segments_N last tried.
+          retryCount++;
+        } else {
+          // Segment file has advanced since our last loop
+          // (we made "progress"), so reset retryCount:
+          retryCount = 0;
         }
 
         lastGen = gen;
@@ -675,7 +748,9 @@ public final class SegmentInfos extends Vector<SegmentInfo> {
 
         try {
           Object v = doBody(segmentFileName);
-          message("success on " + segmentFileName);
+          if (infoStream != null) {
+            message("success on " + segmentFileName);
+          }
           return v;
         } catch (IOException err) {
 
@@ -684,12 +759,14 @@ public final class SegmentInfos extends Vector<SegmentInfo> {
             exc = err;
           }
 
-          message("primary Exception on '" + segmentFileName + "': " + err + "'; will retry: retry=" + retry + "; gen = " + gen);
+          if (infoStream != null) {
+            message("primary Exception on '" + segmentFileName + "': " + err + "'; will retry: retryCount=" + retryCount + "; gen = " + gen);
+          }
 
-          if (!retry && gen > 1) {
+          if (gen > 1 && useFirstMethod && retryCount == 1) {
 
-            // This is our first time trying this segments
-            // file (because retry is false), and, there is
+            // This is our second time trying this same segments
+            // file (because retryCount is 1), and, there is
             // possibly a segments_(N-1) (because gen > 1).
             // So, check if the segments_(N-1) exists and
             // try it if so:
@@ -701,15 +778,19 @@ public final class SegmentInfos extends Vector<SegmentInfo> {
             prevExists = directory.fileExists(prevSegmentFileName);
 
             if (prevExists) {
-              message("fallback to prior segment file '" + prevSegmentFileName + "'");
+              if (infoStream != null) {
+                message("fallback to prior segment file '" + prevSegmentFileName + "'");
+              }
               try {
                 Object v = doBody(prevSegmentFileName);
-                if (exc != null) {
+                if (infoStream != null) {
                   message("success on fallback " + prevSegmentFileName);
                 }
                 return v;
               } catch (IOException err2) {
-                message("secondary Exception on '" + prevSegmentFileName + "': " + err2 + "'; will retry");
+                if (infoStream != null) {
+                  message("secondary Exception on '" + prevSegmentFileName + "': " + err2 + "'; will retry");
+                }
               }
             }
           }
@@ -731,10 +812,13 @@ public final class SegmentInfos extends Vector<SegmentInfo> {
    * instances in the specified range first (inclusive) to
    * last (exclusive), so total number of segments returned
    * is last-first.
+   * @deprecated use {@code asList().subList(first, last)}
+   * instead.
    */
+  @Deprecated
   public SegmentInfos range(int first, int last) {
     SegmentInfos infos = new SegmentInfos();
-    infos.addAll(super.subList(first, last));
+    infos.addAll(segments.subList(first, last));
     return infos;
   }
 
@@ -742,7 +826,6 @@ public final class SegmentInfos extends Vector<SegmentInfo> {
   void updateGeneration(SegmentInfos other) {
     lastGeneration = other.lastGeneration;
     generation = other.generation;
-    version = other.version;
   }
 
   final void rollbackCommit(Directory dir) throws IOException {
@@ -758,7 +841,7 @@ public final class SegmentInfos extends Vector<SegmentInfo> {
       // since lastGeneration isn't incremented:
       try {
         final String segmentFileName = IndexFileNames.fileNameFromGeneration(IndexFileNames.SEGMENTS,
-                                                                             "",
+                                                                              "",
                                                                              generation);
         dir.deleteFile(segmentFileName);
       } catch (Throwable t) {
@@ -773,7 +856,12 @@ public final class SegmentInfos extends Vector<SegmentInfo> {
    *  segments file, but writes an invalid checksum at the
    *  end, so that it is not visible to readers.  Once this
    *  is called you must call {@link #finishCommit} to complete
-   *  the commit or {@link #rollbackCommit} to abort it. */
+   *  the commit or {@link #rollbackCommit} to abort it.
+   *  <p>
+   *  Note: {@link #changed()} should be called prior to this
+   *  method if changes have been made to this {@link SegmentInfos} instance
+   *  </p>  
+   **/
   final void prepareCommit(Directory dir) throws IOException {
     if (pendingSegnOutput != null)
       throw new IllegalStateException("prepareCommit was already called");
@@ -829,7 +917,7 @@ public final class SegmentInfos extends Vector<SegmentInfo> {
                                                                   generation);
     success = false;
     try {
-      dir.sync(fileName);
+      dir.sync(Collections.singleton(fileName));
       success = true;
     } finally {
       if (!success) {
@@ -852,6 +940,8 @@ public final class SegmentInfos extends Vector<SegmentInfo> {
       } finally {
         genOutput.close();
       }
+    } catch (ThreadInterruptedException t) {
+      throw t;
     } catch (Throwable t) {
       // It's OK if we fail to write this file since it's
       // used only as one of the retry fallbacks.
@@ -859,23 +949,27 @@ public final class SegmentInfos extends Vector<SegmentInfo> {
   }
 
   /** Writes & syncs to the Directory dir, taking care to
-   *  remove the segments file on exception */
+   *  remove the segments file on exception
+   *  <p>
+   *  Note: {@link #changed()} should be called prior to this
+   *  method if changes have been made to this {@link SegmentInfos} instance
+   *  </p>  
+   **/
   final void commit(Directory dir) throws IOException {
     prepareCommit(dir);
     finishCommit(dir);
   }
 
-  public synchronized String segString(Directory directory) {
+  public String toString(Directory directory) {
     StringBuilder buffer = new StringBuilder();
+    buffer.append(getCurrentSegmentFileName()).append(": ");
     final int count = size();
     for(int i = 0; i < count; i++) {
       if (i > 0) {
         buffer.append(' ');
       }
       final SegmentInfo info = info(i);
-      buffer.append(info.segString(directory));
-      if (info.dir != directory)
-        buffer.append("**");
+      buffer.append(info.toString(directory, 0));
     }
     return buffer.toString();
   }
@@ -897,17 +991,153 @@ public final class SegmentInfos extends Vector<SegmentInfo> {
    *  remain write once.
    */
   void replace(SegmentInfos other) {
-    clear();
-    addAll(other);
+    rollbackSegmentInfos(other.asList());
     lastGeneration = other.lastGeneration;
   }
 
-  // Used only for testing
-  public boolean hasExternalSegments(Directory dir) {
-    final int numSegments = size();
-    for(int i=0;i<numSegments;i++)
-      if (info(i).dir != dir)
-        return true;
-    return false;
+  /** Returns sum of all segment's docCounts.  Note that
+   *  this does not include deletions */
+  public int totalDocCount() {
+    int count = 0;
+    for(SegmentInfo info : this) {
+      count += info.docCount;
+    }
+    return count;
   }
+
+  /** Call this before committing if changes have been made to the
+   *  segments. */
+  public void changed() {
+    version++;
+  }
+  
+  /** applies all changes caused by committing a merge to this SegmentInfos */
+  void applyMergeChanges(MergePolicy.OneMerge merge, boolean dropSegment) {
+    final Set<SegmentInfo> mergedAway = new HashSet<SegmentInfo>(merge.segments);
+    boolean inserted = false;
+    int newSegIdx = 0;
+    for (int segIdx = 0, cnt = segments.size(); segIdx < cnt; segIdx++) {
+      assert segIdx >= newSegIdx;
+      final SegmentInfo info = segments.get(segIdx);
+      if (mergedAway.contains(info)) {
+        if (!inserted && !dropSegment) {
+          segments.set(segIdx, merge.info);
+          inserted = true;
+          newSegIdx++;
+        }
+      } else {
+        segments.set(newSegIdx, info);
+        newSegIdx++;
+      }
+    }
+
+    // Either we found place to insert segment, or, we did
+    // not, but only because all segments we merged became
+    // deleted while we are merging, in which case it should
+    // be the case that the new segment is also all deleted,
+    // we insert it at the beginning if it should not be dropped:
+    if (!inserted && !dropSegment) {
+      segments.add(0, merge.info);
+    }
+
+    // the rest of the segments in list are duplicates, so don't remove from map, only list!
+    segments.subList(newSegIdx, segments.size()).clear();
+    
+    // update the Set
+    if (!dropSegment) {
+      segmentSet.add(merge.info);
+    }
+    segmentSet.removeAll(mergedAway);
+    
+    assert segmentSet.size() == segments.size();
+  }
+
+  List<SegmentInfo> createBackupSegmentInfos(boolean cloneChildren) {
+    if (cloneChildren) {
+      final List<SegmentInfo> list = new ArrayList<SegmentInfo>(size());
+      for(final SegmentInfo info : this) {
+        list.add((SegmentInfo) info.clone());
+      }
+      return list;
+    } else {
+      return new ArrayList<SegmentInfo>(segments);
+    }
+  }
+  
+  void rollbackSegmentInfos(List<SegmentInfo> infos) {
+    this.clear();
+    this.addAll(infos);
+  }
+  
+  /** Returns an <b>unmodifiable</b> {@link Iterator} of contained segments in order. */
+  // @Override (comment out until Java 6)
+  public Iterator<SegmentInfo> iterator() {
+    return asList().iterator();
+  }
+  
+  /** Returns all contained segments as an <b>unmodifiable</b> {@link List} view. */
+  public List<SegmentInfo> asList() {
+    if (cachedUnmodifiableList == null) {
+      cachedUnmodifiableList = Collections.unmodifiableList(segments);
+    }
+    return cachedUnmodifiableList;
+  }
+  
+  /** Returns all contained segments as an <b>unmodifiable</b> {@link Set} view.
+   * The iterator is not sorted, use {@link List} view or {@link #iterator} to get all segments in order. */
+  public Set<SegmentInfo> asSet() {
+    if (cachedUnmodifiableSet == null) {
+      cachedUnmodifiableSet = Collections.unmodifiableSet(segmentSet);
+    }
+    return cachedUnmodifiableSet;
+  }
+  
+  public int size() {
+    return segments.size();
+  }
+
+  public void add(SegmentInfo si) {
+    if (segmentSet.contains(si)) {
+      throw new IllegalStateException("Cannot add the same segment two times to this SegmentInfos instance");
+    }
+    segments.add(si);
+    segmentSet.add(si);
+    assert segmentSet.size() == segments.size();
+  }
+  
+  public void addAll(Iterable<SegmentInfo> sis) {
+    for (final SegmentInfo si : sis) {
+      this.add(si);
+    }
+  }
+  
+  public void clear() {
+    segments.clear();
+    segmentSet.clear();
+  }
+  
+  public void remove(SegmentInfo si) {
+    final int index = this.indexOf(si);
+    if (index >= 0) {
+      this.remove(index);
+    }
+  }
+  
+  public void remove(int index) {
+    segmentSet.remove(segments.remove(index));
+    assert segmentSet.size() == segments.size();
+  }
+  
+  public boolean contains(SegmentInfo si) {
+    return segmentSet.contains(si);
+  }
+
+  public int indexOf(SegmentInfo si) {
+    if (segmentSet.contains(si)) {
+      return segments.indexOf(si);
+    } else {
+      return -1;
+    }
+  }
+
 }

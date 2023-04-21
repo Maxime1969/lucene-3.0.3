@@ -28,21 +28,19 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
+import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.lucene.document.Document;
 import org.apache.lucene.document.FieldSelector;
-import org.apache.lucene.search.DefaultSimilarity;
+import org.apache.lucene.search.Similarity;
 import org.apache.lucene.store.BufferedIndexInput;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.IndexInput;
-import org.apache.lucene.store.IndexOutput;
 import org.apache.lucene.util.BitVector;
 import org.apache.lucene.util.CloseableThreadLocal;
-import org.apache.lucene.search.FieldCache; // not great (circular); used only to purge FieldCache entry on close
+import org.apache.lucene.util.StringHelper;
 
-/** @version $Id */
 /**
- * <p><b>NOTE:</b> This API is new and still experimental
- * (subject to change suddenly in the next release)</p>
+ * @lucene.experimental
  */
 public class SegmentReader extends IndexReader implements Cloneable {
   protected boolean readOnly;
@@ -54,9 +52,12 @@ public class SegmentReader extends IndexReader implements Cloneable {
   CloseableThreadLocal<TermVectorsReader> termVectorsLocal = new CloseableThreadLocal<TermVectorsReader>();
 
   BitVector deletedDocs = null;
-  Ref deletedDocsRef = null;
+  AtomicInteger deletedDocsRef = null;
   private boolean deletedDocsDirty = false;
   private boolean normsDirty = false;
+
+  // TODO: we should move this tracking into SegmentInfo;
+  // this way SegmentInfo.toString shows pending deletes
   private int pendingDeleteCount;
 
   private boolean rollbackHasChanges = false;
@@ -66,243 +67,10 @@ public class SegmentReader extends IndexReader implements Cloneable {
   private int rollbackPendingDeleteCount;
 
   // optionally used for the .nrm file shared by multiple norms
-  private IndexInput singleNormStream;
-  private Ref singleNormRef;
+  IndexInput singleNormStream;
+  AtomicInteger singleNormRef;
 
-  CoreReaders core;
-
-  // Holds core readers that are shared (unchanged) when
-  // SegmentReader is cloned or reopened
-  static final class CoreReaders {
-
-    // Counts how many other reader share the core objects
-    // (freqStream, proxStream, tis, etc.) of this reader;
-    // when coreRef drops to 0, these core objects may be
-    // closed.  A given instance of SegmentReader may be
-    // closed, even those it shares core objects with other
-    // SegmentReaders:
-    private final Ref ref = new Ref();
-
-    final String segment;
-    final FieldInfos fieldInfos;
-    final IndexInput freqStream;
-    final IndexInput proxStream;
-    final TermInfosReader tisNoIndex;
-
-    final Directory dir;
-    final Directory cfsDir;
-    final int readBufferSize;
-    final int termsIndexDivisor;
-
-    private final SegmentReader origInstance;
-
-    TermInfosReader tis;
-    FieldsReader fieldsReaderOrig;
-    TermVectorsReader termVectorsReaderOrig;
-    CompoundFileReader cfsReader;
-    CompoundFileReader storeCFSReader;
-
-    CoreReaders(SegmentReader origInstance, Directory dir, SegmentInfo si, int readBufferSize, int termsIndexDivisor) throws IOException {
-      segment = si.name;
-      this.readBufferSize = readBufferSize;
-      this.dir = dir;
-
-      boolean success = false;
-
-      try {
-        Directory dir0 = dir;
-        if (si.getUseCompoundFile()) {
-          cfsReader = new CompoundFileReader(dir, segment + "." + IndexFileNames.COMPOUND_FILE_EXTENSION, readBufferSize);
-          dir0 = cfsReader;
-        }
-        cfsDir = dir0;
-
-        fieldInfos = new FieldInfos(cfsDir, segment + "." + IndexFileNames.FIELD_INFOS_EXTENSION);
-
-        this.termsIndexDivisor = termsIndexDivisor;
-        TermInfosReader reader = new TermInfosReader(cfsDir, segment, fieldInfos, readBufferSize, termsIndexDivisor);
-        if (termsIndexDivisor == -1) {
-          tisNoIndex = reader;
-        } else {
-          tis = reader;
-          tisNoIndex = null;
-        }
-
-        // make sure that all index files have been read or are kept open
-        // so that if an index update removes them we'll still have them
-        freqStream = cfsDir.openInput(segment + "." + IndexFileNames.FREQ_EXTENSION, readBufferSize);
-
-        if (fieldInfos.hasProx()) {
-          proxStream = cfsDir.openInput(segment + "." + IndexFileNames.PROX_EXTENSION, readBufferSize);
-        } else {
-          proxStream = null;
-        }
-        success = true;
-      } finally {
-        if (!success) {
-          decRef();
-        }
-      }
-
-      // Must assign this at the end -- if we hit an
-      // exception above core, we don't want to attempt to
-      // purge the FieldCache (will hit NPE because core is
-      // not assigned yet).
-      this.origInstance = origInstance;
-    }
-
-    synchronized TermVectorsReader getTermVectorsReaderOrig() {
-      return termVectorsReaderOrig;
-    }
-
-    synchronized FieldsReader getFieldsReaderOrig() {
-      return fieldsReaderOrig;
-    }
-
-    synchronized void incRef() {
-      ref.incRef();
-    }
-
-    synchronized Directory getCFSReader() {
-      return cfsReader;
-    }
-
-    synchronized TermInfosReader getTermsReader() {
-      if (tis != null) {
-        return tis;
-      } else {
-        return tisNoIndex;
-      }
-    }      
-
-    synchronized boolean termsIndexIsLoaded() {
-      return tis != null;
-    }      
-
-    // NOTE: only called from IndexWriter when a near
-    // real-time reader is opened, or applyDeletes is run,
-    // sharing a segment that's still being merged.  This
-    // method is not fully thread safe, and relies on the
-    // synchronization in IndexWriter
-    synchronized void loadTermsIndex(SegmentInfo si, int termsIndexDivisor) throws IOException {
-      if (tis == null) {
-        Directory dir0;
-        if (si.getUseCompoundFile()) {
-          // In some cases, we were originally opened when CFS
-          // was not used, but then we are asked to open the
-          // terms reader with index, the segment has switched
-          // to CFS
-          if (cfsReader == null) {
-            cfsReader = new CompoundFileReader(dir, segment + "." + IndexFileNames.COMPOUND_FILE_EXTENSION, readBufferSize);
-          }
-          dir0 = cfsReader;
-        } else {
-          dir0 = dir;
-        }
-
-        tis = new TermInfosReader(dir0, segment, fieldInfos, readBufferSize, termsIndexDivisor);
-      }
-    }
-
-    synchronized void decRef() throws IOException {
-
-      if (ref.decRef() == 0) {
-
-        // close everything, nothing is shared anymore with other readers
-        if (tis != null) {
-          tis.close();
-          // null so if an app hangs on to us we still free most ram
-          tis = null;
-        }
-        
-        if (tisNoIndex != null) {
-          tisNoIndex.close();
-        }
-        
-        if (freqStream != null) {
-          freqStream.close();
-        }
-
-        if (proxStream != null) {
-          proxStream.close();
-        }
-
-        if (termVectorsReaderOrig != null) {
-          termVectorsReaderOrig.close();
-        }
-  
-        if (fieldsReaderOrig != null) {
-          fieldsReaderOrig.close();
-        }
-  
-        if (cfsReader != null) {
-          cfsReader.close();
-        }
-  
-        if (storeCFSReader != null) {
-          storeCFSReader.close();
-        }
-
-        // Force FieldCache to evict our entries at this point
-        if (origInstance != null) {
-          FieldCache.DEFAULT.purge(origInstance);
-        }
-      }
-    }
-
-    synchronized void openDocStores(SegmentInfo si) throws IOException {
-
-      assert si.name.equals(segment);
-
-      if (fieldsReaderOrig == null) {
-        final Directory storeDir;
-        if (si.getDocStoreOffset() != -1) {
-          if (si.getDocStoreIsCompoundFile()) {
-            assert storeCFSReader == null;
-            storeCFSReader = new CompoundFileReader(dir,
-                                                    si.getDocStoreSegment() + "." + IndexFileNames.COMPOUND_FILE_STORE_EXTENSION,
-                                                    readBufferSize);
-            storeDir = storeCFSReader;
-            assert storeDir != null;
-          } else {
-            storeDir = dir;
-            assert storeDir != null;
-          }
-        } else if (si.getUseCompoundFile()) {
-          // In some cases, we were originally opened when CFS
-          // was not used, but then we are asked to open doc
-          // stores after the segment has switched to CFS
-          if (cfsReader == null) {
-            cfsReader = new CompoundFileReader(dir, segment + "." + IndexFileNames.COMPOUND_FILE_EXTENSION, readBufferSize);
-          }
-          storeDir = cfsReader;
-          assert storeDir != null;
-        } else {
-          storeDir = dir;
-          assert storeDir != null;
-        }
-
-        final String storesSegment;
-        if (si.getDocStoreOffset() != -1) {
-          storesSegment = si.getDocStoreSegment();
-        } else {
-          storesSegment = segment;
-        }
-
-        fieldsReaderOrig = new FieldsReader(storeDir, storesSegment, fieldInfos, readBufferSize,
-                                            si.getDocStoreOffset(), si.docCount);
-
-        // Verify two sources of "maxDoc" agree:
-        if (si.getDocStoreOffset() == -1 && fieldsReaderOrig.size() != si.docCount) {
-          throw new CorruptIndexException("doc counts differ for segment " + segment + ": fieldsReader shows " + fieldsReaderOrig.size() + " but segmentInfo shows " + si.docCount);
-        }
-
-        if (fieldInfos.hasVectors()) { // open term vector files only as needed
-          termVectorsReaderOrig = new TermVectorsReader(storeDir, storesSegment, fieldInfos, readBufferSize, si.getDocStoreOffset(), si.docCount);
-        }
-      }
-    }
-  }
+  SegmentCoreReaders core;
 
   /**
    * Sets the initial value 
@@ -314,266 +82,7 @@ public class SegmentReader extends IndexReader implements Cloneable {
     }
   }
   
-  static class Ref {
-    private int refCount = 1;
-    
-    @Override
-    public String toString() {
-      return "refcount: "+refCount;
-    }
-    
-    public synchronized int refCount() {
-      return refCount;
-    }
-    
-    public synchronized int incRef() {
-      assert refCount > 0;
-      refCount++;
-      return refCount;
-    }
-
-    public synchronized int decRef() {
-      assert refCount > 0;
-      refCount--;
-      return refCount;
-    }
-  }
-  
-  /**
-   * Byte[] referencing is used because a new norm object needs 
-   * to be created for each clone, and the byte array is all 
-   * that is needed for sharing between cloned readers.  The 
-   * current norm referencing is for sharing between readers 
-   * whereas the byte[] referencing is for copy on write which 
-   * is independent of reader references (i.e. incRef, decRef).
-   */
-
-  final class Norm implements Cloneable {
-    private int refCount = 1;
-
-    // If this instance is a clone, the originalNorm
-    // references the Norm that has a real open IndexInput:
-    private Norm origNorm;
-
-    private IndexInput in;
-    private long normSeek;
-
-    // null until bytes is set
-    private Ref bytesRef;
-    private byte[] bytes;
-    private boolean dirty;
-    private int number;
-    private boolean rollbackDirty;
-    
-    public Norm(IndexInput in, int number, long normSeek) {
-      this.in = in;
-      this.number = number;
-      this.normSeek = normSeek;
-    }
-
-    public synchronized void incRef() {
-      assert refCount > 0 && (origNorm == null || origNorm.refCount > 0);
-      refCount++;
-    }
-
-    private void closeInput() throws IOException {
-      if (in != null) {
-        if (in != singleNormStream) {
-          // It's private to us -- just close it
-          in.close();
-        } else {
-          // We are sharing this with others -- decRef and
-          // maybe close the shared norm stream
-          if (singleNormRef.decRef() == 0) {
-            singleNormStream.close();
-            singleNormStream = null;
-          }
-        }
-
-        in = null;
-      }
-    }
-
-    public synchronized void decRef() throws IOException {
-      assert refCount > 0 && (origNorm == null || origNorm.refCount > 0);
-
-      if (--refCount == 0) {
-        if (origNorm != null) {
-          origNorm.decRef();
-          origNorm = null;
-        } else {
-          closeInput();
-        }
-
-        if (bytes != null) {
-          assert bytesRef != null;
-          bytesRef.decRef();
-          bytes = null;
-          bytesRef = null;
-        } else {
-          assert bytesRef == null;
-        }
-      }
-    }
-
-    // Load bytes but do not cache them if they were not
-    // already cached
-    public synchronized void bytes(byte[] bytesOut, int offset, int len) throws IOException {
-      assert refCount > 0 && (origNorm == null || origNorm.refCount > 0);
-      if (bytes != null) {
-        // Already cached -- copy from cache:
-        assert len <= maxDoc();
-        System.arraycopy(bytes, 0, bytesOut, offset, len);
-      } else {
-        // Not cached
-        if (origNorm != null) {
-          // Ask origNorm to load
-          origNorm.bytes(bytesOut, offset, len);
-        } else {
-          // We are orig -- read ourselves from disk:
-          synchronized(in) {
-            in.seek(normSeek);
-            in.readBytes(bytesOut, offset, len, false);
-          }
-        }
-      }
-    }
-
-    // Load & cache full bytes array.  Returns bytes.
-    public synchronized byte[] bytes() throws IOException {
-      assert refCount > 0 && (origNorm == null || origNorm.refCount > 0);
-      if (bytes == null) {                     // value not yet read
-        assert bytesRef == null;
-        if (origNorm != null) {
-          // Ask origNorm to load so that for a series of
-          // reopened readers we share a single read-only
-          // byte[]
-          bytes = origNorm.bytes();
-          bytesRef = origNorm.bytesRef;
-          bytesRef.incRef();
-
-          // Once we've loaded the bytes we no longer need
-          // origNorm:
-          origNorm.decRef();
-          origNorm = null;
-
-        } else {
-          // We are the origNorm, so load the bytes for real
-          // ourself:
-          final int count = maxDoc();
-          bytes = new byte[count];
-
-          // Since we are orig, in must not be null
-          assert in != null;
-
-          // Read from disk.
-          synchronized(in) {
-            in.seek(normSeek);
-            in.readBytes(bytes, 0, count, false);
-          }
-
-          bytesRef = new Ref();
-          closeInput();
-        }
-      }
-
-      return bytes;
-    }
-
-    // Only for testing
-    Ref bytesRef() {
-      return bytesRef;
-    }
-
-    // Called if we intend to change a norm value.  We make a
-    // private copy of bytes if it's shared with others:
-    public synchronized byte[] copyOnWrite() throws IOException {
-      assert refCount > 0 && (origNorm == null || origNorm.refCount > 0);
-      bytes();
-      assert bytes != null;
-      assert bytesRef != null;
-      if (bytesRef.refCount() > 1) {
-        // I cannot be the origNorm for another norm
-        // instance if I'm being changed.  Ie, only the
-        // "head Norm" can be changed:
-        assert refCount == 1;
-        final Ref oldRef = bytesRef;
-        bytes = cloneNormBytes(bytes);
-        bytesRef = new Ref();
-        oldRef.decRef();
-      }
-      dirty = true;
-      return bytes;
-    }
-    
-    // Returns a copy of this Norm instance that shares
-    // IndexInput & bytes with the original one
-    @Override
-    public synchronized Object clone() {
-      assert refCount > 0 && (origNorm == null || origNorm.refCount > 0);
-        
-      Norm clone;
-      try {
-        clone = (Norm) super.clone();
-      } catch (CloneNotSupportedException cnse) {
-        // Cannot happen
-        throw new RuntimeException("unexpected CloneNotSupportedException", cnse);
-      }
-      clone.refCount = 1;
-
-      if (bytes != null) {
-        assert bytesRef != null;
-        assert origNorm == null;
-
-        // Clone holds a reference to my bytes:
-        clone.bytesRef.incRef();
-      } else {
-        assert bytesRef == null;
-        if (origNorm == null) {
-          // I become the origNorm for the clone:
-          clone.origNorm = this;
-        }
-        clone.origNorm.incRef();
-      }
-
-      // Only the origNorm will actually readBytes from in:
-      clone.in = null;
-
-      return clone;
-    }
-
-    // Flush all pending changes to the next generation
-    // separate norms file.
-    public void reWrite(SegmentInfo si) throws IOException {
-      assert refCount > 0 && (origNorm == null || origNorm.refCount > 0): "refCount=" + refCount + " origNorm=" + origNorm;
-
-      // NOTE: norms are re-written in regular directory, not cfs
-      si.advanceNormGen(this.number);
-      final String normFileName = si.getNormFileName(this.number);
-      IndexOutput out = directory().createOutput(normFileName);
-      boolean success = false;
-      try {
-        try {
-          out.writeBytes(bytes, maxDoc());
-        } finally {
-          out.close();
-        }
-        success = true;
-      } finally {
-        if (!success) {
-          try {
-            directory().deleteFile(normFileName);
-          } catch (Throwable t) {
-            // suppress this so we keep throwing the
-            // original exception
-          }
-        }
-      }
-      this.dirty = false;
-    }
-  }
-
-  Map<String,Norm> norms = new HashMap<String,Norm>();
+  Map<String,SegmentNorms> norms = new HashMap<String,SegmentNorms>();
   
   /**
    * @throws CorruptIndexException if the index is corrupt
@@ -602,7 +111,7 @@ public class SegmentReader extends IndexReader implements Cloneable {
     boolean success = false;
 
     try {
-      instance.core = new CoreReaders(instance, dir, si, readBufferSize, termInfosIndexDivisor);
+      instance.core = new SegmentCoreReaders(instance, dir, si, readBufferSize, termInfosIndexDivisor);
       if (doOpenStores) {
         instance.core.openDocStores(si);
       }
@@ -647,8 +156,11 @@ public class SegmentReader extends IndexReader implements Cloneable {
     // NOTE: the bitvector is stored using the regular directory, not cfs
     if (hasDeletions(si)) {
       deletedDocs = new BitVector(directory(), si.getDelFileName());
-      deletedDocsRef = new Ref();
+      deletedDocsRef = new AtomicInteger(1);
       assert checkDeletedCounts();
+      if (deletedDocs.size() != si.docCount) {
+        throw new CorruptIndexException("document count mismatch: deleted docs count " + deletedDocs.size() + " vs segment doc count " + si.docCount + " segment=" + si.name);
+      }
     } else
       assert si.getDelCount() == 0;
   }
@@ -687,6 +199,18 @@ public class SegmentReader extends IndexReader implements Cloneable {
     return reopenSegment(si, true, openReadOnly);
   }
 
+  @Override
+  public synchronized IndexReader reopen()
+    throws CorruptIndexException, IOException {
+    return reopenSegment(si, false, readOnly);
+  }
+
+  @Override
+  public synchronized IndexReader reopen(boolean openReadOnly)
+    throws CorruptIndexException, IOException {
+    return reopenSegment(si, false, openReadOnly);
+  }
+
   synchronized SegmentReader reopenSegment(SegmentInfo si, boolean doClone, boolean openReadOnly) throws CorruptIndexException, IOException {
     boolean deletionsUpToDate = (this.si.hasDeletions() == si.hasDeletions()) 
                                   && (!si.hasDeletions() || this.si.getDelFileName().equals(si.getDelFileName()));
@@ -721,10 +245,11 @@ public class SegmentReader extends IndexReader implements Cloneable {
       clone.readOnly = openReadOnly;
       clone.si = si;
       clone.readBufferSize = readBufferSize;
+      clone.pendingDeleteCount = pendingDeleteCount;
+      clone.readerFinishedListeners = readerFinishedListeners;
 
       if (!openReadOnly && hasChanges) {
         // My pending changes transfer to the new reader
-        clone.pendingDeleteCount = pendingDeleteCount;
         clone.deletedDocsDirty = deletedDocsDirty;
         clone.normsDirty = normsDirty;
         clone.hasChanges = hasChanges;
@@ -733,7 +258,7 @@ public class SegmentReader extends IndexReader implements Cloneable {
       
       if (doClone) {
         if (deletedDocs != null) {
-          deletedDocsRef.incRef();
+          deletedDocsRef.incrementAndGet();
           clone.deletedDocs = deletedDocs;
           clone.deletedDocsRef = deletedDocsRef;
         }
@@ -743,13 +268,13 @@ public class SegmentReader extends IndexReader implements Cloneable {
           assert clone.deletedDocs == null;
           clone.loadDeletedDocs();
         } else if (deletedDocs != null) {
-          deletedDocsRef.incRef();
+          deletedDocsRef.incrementAndGet();
           clone.deletedDocs = deletedDocs;
           clone.deletedDocsRef = deletedDocsRef;
         }
       }
 
-      clone.norms = new HashMap<String,Norm>();
+      clone.norms = new HashMap<String,SegmentNorms>();
 
       // Clone norms
       for (int i = 0; i < fieldNormsChanged.length; i++) {
@@ -757,9 +282,9 @@ public class SegmentReader extends IndexReader implements Cloneable {
         // Clone unchanged norms to the cloned reader
         if (doClone || !fieldNormsChanged[i]) {
           final String curField = core.fieldInfos.fieldInfo(i).name;
-          Norm norm = this.norms.get(curField);
+          SegmentNorms norm = this.norms.get(curField);
           if (norm != null)
-            clone.norms.put(curField, (Norm) norm.clone());
+            clone.norms.put(curField, (SegmentNorms) norm.clone());
         }
       }
 
@@ -795,9 +320,11 @@ public class SegmentReader extends IndexReader implements Cloneable {
     }
   }
 
-  private void commitChanges(Map<String,String> commitUserData) throws IOException {
+  private synchronized void commitChanges(Map<String,String> commitUserData) throws IOException {
     if (deletedDocsDirty) {               // re-write deleted
       si.advanceDelGen();
+
+      assert deletedDocs.size() == si.docCount;
 
       // We can write directly to the actual name (vs to a
       // .tmp & renaming it) because the file is not live
@@ -827,7 +354,7 @@ public class SegmentReader extends IndexReader implements Cloneable {
 
     if (normsDirty) {               // re-write norms
       si.setNumFields(core.fieldInfos.size());
-      for (final Norm norm : norms.values()) {
+      for (final SegmentNorms norm : norms.values()) {
         if (norm.dirty) {
           norm.reWrite(si);
         }
@@ -848,12 +375,12 @@ public class SegmentReader extends IndexReader implements Cloneable {
     fieldsReaderLocal.close();
     
     if (deletedDocs != null) {
-      deletedDocsRef.decRef();
+      deletedDocsRef.decrementAndGet();
       // null so if an app hangs on to us we still free most ram
       deletedDocs = null;
     }
 
-    for (final Norm norm : norms.values()) {
+    for (final SegmentNorms norm : norms.values()) {
       norm.decRef();
     }
     if (core != null) {
@@ -884,20 +411,21 @@ public class SegmentReader extends IndexReader implements Cloneable {
   protected void doDelete(int docNum) {
     if (deletedDocs == null) {
       deletedDocs = new BitVector(maxDoc());
-      deletedDocsRef = new Ref();
+      deletedDocsRef = new AtomicInteger(1);
     }
     // there is more than 1 SegmentReader with a reference to this
     // deletedDocs BitVector so decRef the current deletedDocsRef,
     // clone the BitVector, create a new deletedDocsRef
-    if (deletedDocsRef.refCount() > 1) {
-      Ref oldRef = deletedDocsRef;
+    if (deletedDocsRef.get() > 1) {
+      AtomicInteger oldRef = deletedDocsRef;
       deletedDocs = cloneDeletedDocs(deletedDocs);
-      deletedDocsRef = new Ref();
-      oldRef.decRef();
+      deletedDocsRef = new AtomicInteger(1);
+      oldRef.decrementAndGet();
     }
     deletedDocsDirty = true;
-    if (!deletedDocs.getAndSet(docNum))
+    if (!deletedDocs.getAndSet(docNum)) {
       pendingDeleteCount++;
+    }
   }
 
   @Override
@@ -905,7 +433,7 @@ public class SegmentReader extends IndexReader implements Cloneable {
     deletedDocsDirty = false;
     if (deletedDocs != null) {
       assert deletedDocsRef != null;
-      deletedDocsRef.decRef();
+      deletedDocsRef.decrementAndGet();
       deletedDocs = null;
       deletedDocsRef = null;
       pendingDeleteCount = 0;
@@ -1045,34 +573,31 @@ public class SegmentReader extends IndexReader implements Cloneable {
     return fieldSet;
   }
 
-
   @Override
-  public synchronized boolean hasNorms(String field) {
+  public boolean hasNorms(String field) {
     ensureOpen();
     return norms.containsKey(field);
   }
 
-  // can return null if norms aren't stored
-  protected synchronized byte[] getNorms(String field) throws IOException {
-    Norm norm = norms.get(field);
-    if (norm == null) return null;  // not indexed, or norms not stored
-    return norm.bytes();
-  }
-
-  // returns fake norms if norms aren't available
   @Override
-  public synchronized byte[] norms(String field) throws IOException {
+  public byte[] norms(String field) throws IOException {
     ensureOpen();
-    byte[] bytes = getNorms(field);
-    return bytes;
+    final SegmentNorms norm = norms.get(field);
+    if (norm == null) {
+      // not indexed, or norms not stored
+      return null;  
+    }
+    return norm.bytes();
   }
 
   @Override
   protected void doSetNorm(int doc, String field, byte value)
           throws IOException {
-    Norm norm = norms.get(field);
-    if (norm == null)                             // not an indexed field
-      return;
+    SegmentNorms norm = norms.get(field);
+    if (norm == null) {
+      // field does not store norms
+      throw new IllegalStateException("Cannot setNorm for field " + field + ": norms were omitted");
+    }
 
     normsDirty = true;
     norm.copyOnWrite()[doc] = value;                    // set the value
@@ -1084,18 +609,23 @@ public class SegmentReader extends IndexReader implements Cloneable {
     throws IOException {
 
     ensureOpen();
-    Norm norm = norms.get(field);
+    SegmentNorms norm = norms.get(field);
     if (norm == null) {
-      Arrays.fill(bytes, offset, bytes.length, DefaultSimilarity.encodeNorm(1.0f));
+      Arrays.fill(bytes, offset, bytes.length, Similarity.getDefault().encodeNormValue(1.0f));
       return;
     }
   
     norm.bytes(bytes, offset, maxDoc());
   }
 
+  // For testing
+  /** @lucene.internal */
+  int getPostingsSkipInterval() {
+    return core.getTermsReader().getSkipInterval();
+  }
 
   private void openNorms(Directory cfsDir, int readBufferSize) throws IOException {
-    long nextNormSeek = SegmentMerger.NORMS_HEADER.length; //skip header (header unused for now)
+    long nextNormSeek = SegmentNorms.NORMS_HEADER.length; //skip header (header unused for now)
     int maxDoc = maxDoc();
     for (int i = 0; i < core.fieldInfos.size(); i++) {
       FieldInfo fi = core.fieldInfos.fieldInfo(i);
@@ -1112,7 +642,7 @@ public class SegmentReader extends IndexReader implements Cloneable {
         }
         
         // singleNormFile means multiple norms share this file
-        boolean singleNormFile = fileName.endsWith("." + IndexFileNames.NORMS_EXTENSION);
+        boolean singleNormFile = IndexFileNames.matchesExtension(fileName, IndexFileNames.NORMS_EXTENSION);
         IndexInput normInput = null;
         long normSeek;
 
@@ -1120,20 +650,32 @@ public class SegmentReader extends IndexReader implements Cloneable {
           normSeek = nextNormSeek;
           if (singleNormStream == null) {
             singleNormStream = d.openInput(fileName, readBufferSize);
-            singleNormRef = new Ref();
+            singleNormRef = new AtomicInteger(1);
           } else {
-            singleNormRef.incRef();
+            singleNormRef.incrementAndGet();
           }
           // All norms in the .nrm file can share a single IndexInput since
           // they are only used in a synchronized context.
           // If this were to change in the future, a clone could be done here.
           normInput = singleNormStream;
         } else {
-          normSeek = 0;
           normInput = d.openInput(fileName);
+          // if the segment was created in 3.2 or after, we wrote the header for sure,
+          // and don't need to do the sketchy file size check. otherwise, we check 
+          // if the size is exactly equal to maxDoc to detect a headerless file.
+          // NOTE: remove this check in Lucene 5.0!
+          String version = si.getVersion();
+          final boolean isUnversioned = 
+            (version == null || StringHelper.getVersionComparator().compare(version, "3.2") < 0)
+            && normInput.length() == maxDoc();
+          if (isUnversioned) {
+            normSeek = 0;
+          } else {
+            normSeek = SegmentNorms.NORMS_HEADER.length;
+          }
         }
 
-        norms.put(fi.name, new Norm(normInput, fi.number, normSeek));
+        norms.put(fi.name, new SegmentNorms(normInput, fi.number, normSeek, this));
         nextNormSeek += maxDoc; // increment also if some norms are separate
       }
     }
@@ -1157,7 +699,7 @@ public class SegmentReader extends IndexReader implements Cloneable {
     if (singleNormStream != null) {
       return false;
     }
-    for (final Norm norm : norms.values()) {
+    for (final SegmentNorms norm : norms.values()) {
       if (norm.refCount > 0) {
         return false;
       }
@@ -1264,6 +806,17 @@ public class SegmentReader extends IndexReader implements Cloneable {
     return termVectorsReader.get(docNumber);
   }
   
+  /** {@inheritDoc} */
+  @Override
+  public String toString() {
+    final StringBuilder buffer = new StringBuilder();
+    if (hasChanges) {
+      buffer.append('*');
+    }
+    buffer.append(si.toString(core.dir, pendingDeleteCount));
+    return buffer.toString();
+  }
+
   /**
    * Return the name of the segment this reader is reading.
    */
@@ -1288,7 +841,7 @@ public class SegmentReader extends IndexReader implements Cloneable {
     rollbackDeletedDocsDirty = deletedDocsDirty;
     rollbackNormsDirty = normsDirty;
     rollbackPendingDeleteCount = pendingDeleteCount;
-    for (Norm norm : norms.values()) {
+    for (SegmentNorms norm : norms.values()) {
       norm.rollbackDirty = norm.dirty;
     }
   }
@@ -1299,7 +852,7 @@ public class SegmentReader extends IndexReader implements Cloneable {
     deletedDocsDirty = rollbackDeletedDocsDirty;
     normsDirty = rollbackNormsDirty;
     pendingDeleteCount = rollbackPendingDeleteCount;
-    for (Norm norm : norms.values()) {
+    for (SegmentNorms norm : norms.values()) {
       norm.dirty = norm.rollbackDirty;
     }
   }
@@ -1317,7 +870,7 @@ public class SegmentReader extends IndexReader implements Cloneable {
   // share the underlying postings data) will map to the
   // same entry in the FieldCache.  See LUCENE-1579.
   @Override
-  public final Object getFieldCacheKey() {
+  public final Object getCoreCacheKey() {
     return core.freqStream;
   }
 
@@ -1338,6 +891,7 @@ public class SegmentReader extends IndexReader implements Cloneable {
    * We do it with R/W access for the tests (BW compatibility)
    * @deprecated Remove this when tests are fixed!
    */
+  @Deprecated
   static SegmentReader getOnlySegmentReader(Directory dir) throws IOException {
     return getOnlySegmentReader(IndexReader.open(dir,false));
   }
@@ -1360,5 +914,15 @@ public class SegmentReader extends IndexReader implements Cloneable {
   @Override
   public int getTermInfosIndexDivisor() {
     return core.termsIndexDivisor;
+  }
+
+  @Override
+  protected void readerFinished() {
+    // Do nothing here -- we have more careful control on
+    // when to notify that a SegmentReader has finished,
+    // because a given core is shared across many cloned
+    // SegmentReaders.  We only notify once that core is no
+    // longer used (all SegmentReaders sharing it have been
+    // closed).
   }
 }
